@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>Blast-Off Follies</title>
+    <link rel="icon" href="data:,">
+    <script>
+      // Whether the player has gone somewhere else: the tab hidden, or another
+      // window or app in front. Kept as data-away on <html>, which the game
+      // reads to pause itself (see page.rs) and the sound below follows.
+      //
+      // Tracked from blur and focus events, not document.hasFocus(): some
+      // Android browsers (DuckDuckGo's) say the page never has the focus, even
+      // while the player is tapping it, which froze the game on its title
+      // card. A touch, click or key always means the player is here.
+      (function () {
+        let blurred = false;
+        const update = () => {
+          const away = document.visibilityState !== 'visible' || blurred;
+          document.documentElement.toggleAttribute('data-away', away);
+        };
+        const here = () => { blurred = false; update(); };
+        window.addEventListener('blur', () => { blurred = true; update(); });
+        window.addEventListener('focus', here);
+        for (const type of ['pointerdown', 'touchstart', 'keydown']) {
+          document.addEventListener(type, here, { capture: true });
+        }
+        document.addEventListener('visibilitychange', update);
+        window.addEventListener('pagehide', update);
+        window.addEventListener('pageshow', update);
+        window.gameAway = () => document.documentElement.hasAttribute('data-away');
+      })();
+    </script>
+    <script>
+      // Browsers start any AudioContext created before the user interacts with
+      // the page in a suspended state. Bevy's audio creates its context while
+      // the game loads, so remember every context and resume them on the first
+      // click, key or touch (the title card asks for one). Must run before the
+      // game's script, which is why it sits above the Trunk link.
+      //
+      // iPhones need more:
+      // - After a phone call, Siri, locking the screen or switching apps, iOS
+      //   leaves a context "interrupted" (not "suspended"), so any state but
+      //   running gets resumed, on every touch, not just the first.
+      // - Safari only lets a finger start audio on touchend, pointerup or
+      //   click (pointerdown counts only for a mouse).
+      // - The ring/silent switch mutes web audio, unless the page says it
+      //   plays media: navigator.audioSession on iOS 17 and up, and before
+      //   that, a silent looping <audio> element.
+      //
+      // The sound also stops while the player is away (another tab, another
+      // app, the window in the background); the game pauses itself too.
+      (function () {
+        const Original = window.AudioContext || window.webkitAudioContext;
+        if (!Original) return;
+        const contexts = [];
+        function Tracked(...args) {
+          const ctx = new Original(...args);
+          contexts.push(ctx);
+          return ctx;
+        }
+        Tracked.prototype = Original.prototype;
+        window.AudioContext = Tracked;
+        if (window.webkitAudioContext) window.webkitAudioContext = Tracked;
+        window.__gameAudioContexts = contexts; // for tests
+
+        let keepAlive = null;
+        if (navigator.audioSession) {
+          try { navigator.audioSession.type = 'playback'; } catch (e) {}
+        } else if (/iPhone|iPad|iPod/.test(navigator.userAgent) ||
+                   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) {
+          // A tenth of a second of 8-bit silence, made here rather than shipped.
+          const n = 800;
+          const wav = new DataView(new ArrayBuffer(44 + n));
+          const text = (at, s) => { for (let i = 0; i < s.length; i++) wav.setUint8(at + i, s.charCodeAt(i)); };
+          text(0, 'RIFF'); wav.setUint32(4, 36 + n, true); text(8, 'WAVEfmt ');
+          wav.setUint32(16, 16, true); wav.setUint16(20, 1, true); wav.setUint16(22, 1, true);
+          wav.setUint32(24, 8000, true); wav.setUint32(28, 8000, true);
+          wav.setUint16(32, 1, true); wav.setUint16(34, 8, true);
+          text(36, 'data'); wav.setUint32(40, n, true);
+          for (let i = 0; i < n; i++) wav.setUint8(44 + i, 128);
+          keepAlive = new Audio(URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })));
+          keepAlive.loop = true;
+        }
+
+        const resume = () => {
+          for (const ctx of contexts) {
+            if (ctx.state !== 'running' && ctx.state !== 'closed') {
+              ctx.resume().catch(() => {});
+            }
+          }
+          if (keepAlive && keepAlive.paused) keepAlive.play().catch(() => {});
+        };
+        for (const type of ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown']) {
+          document.addEventListener(type, resume, { capture: true });
+        }
+        const pause = () => {
+          for (const ctx of contexts) {
+            if (ctx.state === 'running') ctx.suspend().catch(() => {});
+          }
+          if (keepAlive && !keepAlive.paused) keepAlive.pause();
+        };
+        // Coming back: start again straight away (iOS may still want a tap).
+        const check = () => {
+          if (window.gameAway()) pause();
+          else resume();
+        };
+        document.addEventListener('visibilitychange', check);
+        window.addEventListener('blur', pause);
+        window.addEventListener('focus', check);
+        window.addEventListener('pagehide', pause);
+        window.addEventListener('pageshow', check);
+      })();
+    </script>
+    <!-- Trunk builds the crate to WebAssembly; the wasm-release profile keeps the download small.
+         loader.js drives the loading screen's progress as the download comes in. -->
+    
+<script type="module">
+async function __trunkInitializer(init, source, sourceSize, initializer, initWithObject) {
+  if (initializer === undefined) {
+    return await init(initWithObject ? { module_or_path: source } : source);
+  }
+
+  const {
+    onStart, onProgress, onComplete, onSuccess, onFailure
+  } = initializer;
+
+  onStart?.();
+
+  const response = fetch(source)
+      .then((response) => {
+        const reader = response.body.getReader();
+        const headers = response.headers;
+        const status = response.status;
+        const statusText = response.statusText;
+
+        const total = sourceSize;
+        let current = 0;
+
+        const stream = new ReadableStream({
+          start(controller) {
+            function push() {
+              reader.read().then(({done, value}) => {
+                if (done) {
+                  onProgress?.({current: total, total});
+                  controller.close();
+                  return;
+                }
+
+                current += value.byteLength;
+                onProgress?.({current, total});
+                controller.enqueue(value);
+                push();
+              });
+            }
+
+            push();
+          },
+        });
+
+        return {
+          stream, init: {
+            headers, status, statusText
+          }
+        };
+      })
+      .then(({stream, init}) =>
+          new Response(stream, init),
+      );
+
+  return init(initWithObject ? { module_or_path: response } : response)
+      .then((value) => {
+        onComplete?.();
+        onSuccess?.(value);
+        return value;
+      }, (reason) => {
+        onComplete?.();
+        onFailure?.(reason);
+        return reason;
+      });
+}
+
+
+import init, * as bindings from '/rocket-game-web/prj-d625028ca3accfb2.js';
+import initializer from '/rocket-game-web/loader-2af0f4b71f750230.js';
+
+const wasm = await __trunkInitializer(init, '/rocket-game-web/prj-d54c23cd6b4e1099_bg.wasm', 100748376, initializer(), true);
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+    
+    <!-- The download's real size, filled in by the deploy workflow: the size
+         Trunk tells loader.js is from before wasm-opt shrinks the file. -->
+    <meta name="wasm-size" content="39914708">
+    <style>
+      html, body { margin: 0; height: 100%; background: #eadcbf; overflow: hidden; }
+      canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
+      /* Phones held upright: the game needs a wide screen. */
+      #rotate {
+        display: none; position: fixed; inset: 0; z-index: 10;
+        place-items: center; padding: 24px; text-align: center; background: #1a130c; color: #eadcbf;
+        font: 600 20px/1.5 Georgia, serif; letter-spacing: .12em; text-transform: uppercase;
+      }
+      @media (orientation: portrait) and (pointer: coarse) {
+        #rotate { display: grid; }
+      }
+      /* The loading screen: a film leader counting down, the title, and a
+         strip of film that fills as the game downloads. */
+      @font-face { font-family: Limelight; src: url('Limelight-Regular.ttf'); font-display: block; }
+      #loading {
+        position: fixed; inset: 0; z-index: 20; display: grid; place-content: center; justify-items: center;
+        gap: 22px; padding: 24px; text-align: center; color: #eadcbf;
+        background: radial-gradient(ellipse at center, #3b2e1f 0%, #1a130c 70%);
+        font: 600 15px/1.4 Georgia, serif; letter-spacing: .2em; text-transform: uppercase;
+        transition: opacity .6s ease;
+      }
+      #loading.done { opacity: 0; pointer-events: none; }
+      #leader {
+        position: relative; width: min(34vmin, 220px); aspect-ratio: 1; border-radius: 50%;
+        border: 4px solid #eadcbf; box-shadow: 0 0 0 6px #1a130c, 0 0 0 9px #c9a35a;
+        background: #b0966b; overflow: hidden;
+      }
+      #leader::before, #leader::after {
+        content: ''; position: absolute; background: #1a130c; opacity: .55;
+      }
+      #leader::before { left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-1px); }
+      #leader::after { top: 50%; left: 0; right: 0; height: 2px; transform: translateY(-1px); }
+      #sweep {
+        position: absolute; inset: 0; border-radius: 50%;
+        background: conic-gradient(rgba(26, 19, 12, .45) var(--turn, 0deg), transparent 0);
+      }
+      #ring { position: absolute; inset: 14%; border-radius: 50%; border: 3px solid #eadcbf; }
+      #count {
+        position: absolute; inset: 0; display: grid; place-items: center;
+        font: calc(min(34vmin, 220px) * .5)/1 Limelight, Georgia, serif; color: #1a130c;
+      }
+      #loading h1 {
+        margin: 0; font: clamp(28px, 6vmin, 52px)/1.1 Limelight, Georgia, serif; letter-spacing: .04em;
+        text-transform: none; color: #eadcbf; text-shadow: 3px 3px 0 #1a130c;
+      }
+      #strip {
+        position: relative; width: min(70vw, 420px); height: 30px; background: #1a130c;
+        border-top: 2px solid #c9a35a; border-bottom: 2px solid #c9a35a; overflow: hidden;
+      }
+      #fill { position: absolute; inset: 7px 0; width: 0; background: #c9a35a; transition: width .2s linear; }
+      /* Sprocket holes along both edges. */
+      #strip::before, #strip::after {
+        content: ''; position: absolute; left: 0; right: 0; height: 4px; z-index: 1;
+        background: repeating-linear-gradient(90deg, #eadcbf 0 6px, transparent 6px 14px);
+      }
+      #strip::before { top: 1px; }
+      #strip::after { bottom: 1px; }
+      #status { min-height: 1.4em; }
+    </style>
+  <link rel="modulepreload" href="/rocket-game-web/prj-d625028ca3accfb2.js" crossorigin="anonymous" integrity="sha384-RGi4C8d4ErlRRL74mEWVk5Q2rg5p8126gFxohx4eq3Hdo/lIgwPc1/mhpaa5N7rd"><link rel="modulepreload" href="/rocket-game-web/loader-2af0f4b71f750230.js" crossorigin="anonymous" integrity="sha384-y73i6UBPlXBWdCq2lgU3APYvtQn720sihX5Y/l4o0dwnp6i+3pL93ujhezfj9zGO"><link rel="preload" href="/rocket-game-web/prj-d54c23cd6b4e1099_bg.wasm" crossorigin="anonymous" integrity="sha384-j5VDfY+wa0RVKCOaepzr4PR1Ee2W7jwk+50c1shX3vLH9Qz0/8tpwZ1VmgOQztMP" as="fetch" type="application/wasm"></head>
+  <body>
+    <div id="loading">
+      <div id="leader"><div id="sweep"></div><div id="ring"></div><div id="count">3</div></div>
+      <h1>Blast-Off Follies</h1>
+      <div id="strip"><div id="fill"></div></div>
+      <div id="status">Threading the projector…</div>
+    </div>
+    <div id="rotate">Turn your phone sideways to play</div>
+    <canvas id="game-canvas"></canvas>
+    <script>
+      // The leader counts down 3, 2, 1 and around again, its hand sweeping
+      // once a second, until the game is running. The game fades the
+      // loading screen out itself, once it has drawn (see page.rs).
+      (function () {
+        const sweep = document.getElementById('sweep');
+        const count = document.getElementById('count');
+        const loading = document.getElementById('loading');
+        const start = performance.now();
+        const tick = (now) => {
+          if (loading.classList.contains('done')) return;
+          const t = (now - start) / 1000;
+          sweep.style.setProperty('--turn', ((t % 1) * 360).toFixed(1) + 'deg');
+          count.textContent = 3 - (Math.floor(t) % 3);
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      })();
+    </script>
+  </body>
+</html>
